@@ -424,7 +424,10 @@ class HudCanvas(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        # The HUD is intentionally capped at 30 FPS: paintEvent is the most
+        # expensive widget paint in the app, and 60 FPS provides little visual
+        # benefit for these slow-moving rings.
+        self._tmr.start(33)
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
