@@ -307,8 +307,12 @@ def _resolve_browser(name: str) -> dict | None:
                     exe = str(found_bins[0])
                     break
 
-    if not exe and _OS == "Windows" and not channel:
-        exe = _find_exe_windows(name)
+    if not exe and _OS == "Windows":
+        # Chromium browsers like Chrome/Edge are keyed by a channel name rather
+        # than a literal binary name. If the direct PATH lookup misses, we still
+        # need to consult the Windows App Paths/StartMenu registry entry to find
+        # the actual executable so the browser can be relaunched with CDP.
+        exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
 
     return {"engine": engine, "exe": exe, "channel": channel}
 
