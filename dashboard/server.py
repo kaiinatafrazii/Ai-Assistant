@@ -18,6 +18,8 @@ import string
 import time
 from pathlib import Path
 
+from core import user_paths
+
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -42,10 +44,15 @@ MAX_UPLOAD_MB = 500
 
 
 def _make_uploads_dir() -> Path:
-    """Return (and create) the cross-platform uploads folder."""
+    """Return (and create) the cross-platform uploads folder.
+
+    Prefer the user's real Downloads/Documents folders so OneDrive-moved and
+    translated Windows folders are respected instead of stale home-relative
+    paths such as C:\Users\NAME\Downloads.
+    """
     for candidate in [
-        Path.home() / "Downloads" / "JUDO Uploads",
-        Path.home() / "Documents" / "JUDO Uploads",
+        user_paths.downloads() / "JUDO Uploads",
+        user_paths.documents() / "JUDO Uploads",
         BASE_DIR / "uploads",
     ]:
         try:

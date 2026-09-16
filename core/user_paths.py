@@ -64,16 +64,17 @@ def _lookup(kind: str) -> Path:
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
             ) as key:
                 raw, _ = winreg.QueryValueEx(key, _WIN_KEYS[kind])
-            resolved = Path(os.path.expandvars(raw))
-            if resolved.is_dir():
-                return resolved
+            if raw:
+                resolved = Path(os.path.expandvars(raw)).expanduser()
+                if str(resolved).strip():
+                    return resolved
         except Exception:
             pass
     elif _OS == "Linux":
         xdg = os.environ.get(_XDG_VARS[kind], "")
         if xdg:
             resolved = Path(os.path.expandvars(xdg)).expanduser()
-            if resolved.is_dir():
+            if str(resolved).strip():
                 return resolved
 
     return fallback
