@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import platform
 import shutil
@@ -443,6 +444,32 @@ def _terminate(browser_name: str) -> None:
         pass
 
 
+def _clear_stale_profile_state(profile_dir: str) -> None:
+    """After taskkill /F, the profile is left in the same state as a crash:
+    Singleton* lock files still reference the now-dead PID, and Chrome marks
+    the profile as 'exited uncleanly'. On relaunch that can either confuse the
+    new process (rare hang while it evaluates the stale lock) or pop the
+    'Chrome didn't shut down correctly — Restore pages?' prompt, which sits
+    there waiting for a click no one is going to make — both show up here as
+    "did not open its debug port in time". Best-effort and non-fatal: if any
+    step fails, relaunch proceeds exactly as before this existed."""
+    root = Path(profile_dir)
+    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (root / lock).unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        prefs_path = root / "Default" / "Preferences"
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+        profile = prefs.setdefault("profile", {})
+        profile["exit_type"]      = "Normal"
+        profile["exited_cleanly"] = True
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _resolve_exe_path(name: str) -> Optional[str]:
     """Best-effort path to the real browser executable, for spawning it
     ourselves with the CDP debug flag (as opposed to Playwright's own
@@ -474,6 +501,9 @@ def _looks_like_dead_context(e: Exception) -> bool:
     return "closed" in msg and ("target page" in msg or "context" in msg or "browser" in msg)
 
 
+_INIT_TIMEOUT = 45  # seconds to wait for the Playwright driver process to come up
+
+
 class _BrowserSession:
     """
     A full session for one browser instance.
@@ -500,6 +530,15 @@ class _BrowserSession:
         # recovery, or a JUDO hiccup would slam the user's whole browser shut.
         self._cdp_browser: Browser | None = None
 
+        # Monotonic time of the last kill+restart this session attempted.
+        # Without tracking this, a slow relaunch (e.g. --restore-last-session
+        # bringing back a large real tab set) that times out waiting for CDP
+        # gets treated as "not running" by the NEXT action and killed and
+        # relaunched all over again — leaving the first attempt's Chrome
+        # process orphaned in the background and making every subsequent
+        # attempt start from a heavier, more loaded machine than the last.
+        self._last_relaunch_attempt = 0.0
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -510,15 +549,19 @@ class _BrowserSession:
         )
         self._thread.start()
         # If _async_init() (spinning up the Playwright driver) hasn't finished
-        # within 20s — a loaded system, first-run driver startup — this used to
-        # return anyway and let the caller use self._pw while it was still None,
-        # surfacing as a baffling "'NoneType' object has no attribute 'chromium'"
-        # instead of a clear error. The registry never caches this session on
-        # failure (see _get_or_create), so the next call just tries again fresh.
-        if not self._ready.wait(timeout=20):
+        # within _INIT_TIMEOUT — a loaded system, first-run driver startup —
+        # this used to return anyway and let the caller use self._pw while it
+        # was still None, surfacing as a baffling "'NoneType' object has no
+        # attribute 'chromium'" instead of a clear error. The registry never
+        # caches this session on failure (see _get_or_create), so the next
+        # call just tries again fresh. Raised from 20s to 45s after this fired
+        # on a real machine where the driver process (normally ~2s) got starved
+        # by other apps at 70-85% CPU/RAM — the process just needed more time,
+        # not a different fix.
+        if not self._ready.wait(timeout=_INIT_TIMEOUT):
             raise RuntimeError(
                 f"Browser automation engine for '{self.browser_name}' did not "
-                f"initialize within 20s (system may be under heavy load) — please try again."
+                f"initialize within {_INIT_TIMEOUT}s (system under heavy load) — please try again."
             )
 
     def _run_loop(self):
@@ -641,6 +684,25 @@ class _BrowserSession:
             await self._attach_cdp(port, label)
             return
 
+        # 1.5) We ourselves killed and relaunched this browser recently and it
+        #      is still running (didn't crash) but CDP isn't up yet — this is
+        #      almost certainly that SAME relaunch still warming up (loading
+        #      extensions, restoring the previous session's tabs), not a new
+        #      problem. Give it more time instead of killing an in-progress
+        #      startup and launching yet another Chrome process on top of it.
+        since_last_attempt = time.monotonic() - self._last_relaunch_attempt
+        if since_last_attempt < 90 and _is_running(self.browser_name):
+            print(f"[Browser] {self.browser_name} is still starting up from a "
+                  f"relaunch {since_last_attempt:.0f}s ago — waiting instead of "
+                  f"restarting it again.")
+            if _wait_for_cdp(port, timeout=25.0):
+                await self._attach_cdp(port, label)
+                return
+            raise RuntimeError(
+                f"{self.browser_name} is still starting up (system may be under "
+                f"heavy load) — please try again in a moment."
+            )
+
         # 2) Same browser is running WITHOUT debugging enabled. Chromium only
         #    reads --remote-debugging-port at startup, and its single-instance
         #    lock means a second launch just hands its args to that existing
@@ -666,18 +728,33 @@ class _BrowserSession:
             raise RuntimeError(f"Could not locate an executable for {self.browser_name}.")
 
         profile = _real_profile_dir(self.browser_name)
+        # A taskkill /F above (or any earlier crash) leaves the profile marked
+        # 'exited uncleanly' with stale Singleton* lock files still pointing at
+        # the dead PID — left alone, the relaunch can either sit stuck on that
+        # stale lock or pop a 'Restore pages?' prompt nobody is there to click,
+        # both surfacing as "did not open its debug port in time" below.
+        _clear_stale_profile_state(profile)
         subprocess.Popen(
             [exe,
              f"--remote-debugging-port={port}",
              f"--user-data-dir={profile}",
              "--no-first-run",
-             "--disable-blink-features=AutomationControlled",
+             # Force the previous tabs back regardless of the user's own
+             # "on startup" setting — without this, a profile that isn't set
+             # to "Continue where you left off" reopens to a blank new-tab
+             # page after the restart above, i.e. every open tab looks like
+             # it just vanished. --restore-last-session reads the same
+             # continuously-autosaved session data Chrome's own crash-restore
+             # infobar would have used — pairing it with the exit_type/
+             # exited_cleanly patch above means tabs come back WITHOUT that
+             # infobar ever popping up asking someone to click it.
+             "--restore-last-session",
              "--disable-default-apps",
              "--no-default-browser-check"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-        if not _wait_for_cdp(port, timeout=20.0):
+        if not _wait_for_cdp(port, timeout=30.0):
             raise RuntimeError(f"{self.browser_name} did not open its debug port in time.")
 
         await self._attach_cdp(port, label)
@@ -732,7 +809,27 @@ class _BrowserSession:
 
     async def go_to(self, url: str) -> str:
 
-        url      = _normalize_url(url)
+        url = _normalize_url(url)
+
+        # Not already attached, and this is a Chromium browser with no CDP
+        # session up — don't force-restart the user's already-open window
+        # just to load a URL. Chrome's own single-instance lock means
+        # launching `chrome.exe <url>` while it's already running silently
+        # hands the URL to that SAME window as a new tab: no restart, no
+        # debug port touched, nothing closed. (If the browser isn't running
+        # at all, this just opens it fresh, same as double-clicking its
+        # icon.) Only actions that actually need to click/type/read the page
+        # (see click/type/screenshot below) pay the one-time CDP-restart cost.
+        if (self._context is None and self._spec and self._spec["engine"] == "chromium"
+                and not _cdp_alive(_CDP_PORTS.get(self.browser_name, 9222))):
+            exe = self._spec["exe"] or _resolve_exe_path(self.browser_name)
+            if exe:
+                try:
+                    subprocess.Popen([exe, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return f"Opened: {url}"
+                except Exception as e:
+                    print(f"[Browser] Native open failed ({e}) — falling back to automated launch")
+
         page     = await self._get_page()
         prev_url = page.url
 
@@ -920,12 +1017,17 @@ class _BrowserSession:
         return f"Could not find input: '{description}' on {page.url}.{shot}"
 
     async def new_tab(self, url: str = "") -> str:
+        # With a URL, this is just navigation — let go_to's own fast path
+        # decide whether that needs a real Playwright page at all (it won't,
+        # for an already-open Chromium browser with no CDP session up).
+        # Forcing _get_page() here first would launch/attach unconditionally
+        # and defeat that.
+        if url:
+            return await self.go_to(url)
         page = await self._get_page()
         ctx  = page.context
         new  = await ctx.new_page()
         self._page = new
-        if url:
-            return await self.go_to(url)
         return "New tab opened."
 
     async def close_tab(self) -> str:
@@ -993,12 +1095,25 @@ class _SessionRegistry:
 
     def _get_or_create(self, browser_name: str) -> _BrowserSession:
         with self._lock:
-            if browser_name not in self._sessions:
-                sess = _BrowserSession(browser_name)
-                sess.start()
-                self._sessions[browser_name] = sess
+            sess = self._sessions.get(browser_name)
+        if sess is not None:
+            return sess
+
+        # sess.start() blocks for up to _INIT_TIMEOUT (45s) spinning up the
+        # Playwright driver — done OUTSIDE the lock, or every unrelated
+        # browser_control call (switch/list/close, even for a different
+        # browser) would queue up behind it for no reason.
+        new_sess = _BrowserSession(browser_name)
+        new_sess.start()
+        with self._lock:
+            sess = self._sessions.get(browser_name)
+            if sess is None:
+                self._sessions[browser_name] = sess = new_sess
                 print(f"[Registry] New session: {browser_name}")
-            return self._sessions[browser_name]
+            # else: another thread already created one for this browser_name in
+            # the meantime (rare race) — new_sess is simply left unreferenced;
+            # its daemon thread stays idle and dies with the process.
+        return sess
 
     def get(self, browser_name: str | None = None) -> _BrowserSession:
         if not browser_name:

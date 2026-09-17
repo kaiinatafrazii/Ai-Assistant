@@ -126,15 +126,15 @@ def _pcm_level(samples) -> float:
     return min(1.0, (rms - _LEVEL_FLOOR) / (_LEVEL_FULL - _LEVEL_FLOOR))
 
 
-def _get_api_key() -> str:
-    """First configured key — used by one-off calls (session summaries) that
-    don't need rotation. The live connection loop uses
-    JudoLive._current_api_key() / _rotate_api_key() instead."""
-    keys = get_gemini_api_keys()
-    if keys:
-        return keys[0]
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+# NOTE: a per-block quiet-speech gain boost lived here briefly (2026-09-17) and
+# was reverted the same day — computing gain independently per 64ms callback
+# block with no attack/release smoothing produced audible discontinuities
+# whenever loudness crossed the boost threshold mid-word, and JUDO stopped
+# responding to speech at all (stuck on LISTENING, never THINKING) right after
+# it shipped. If quiet-speech capture needs revisiting, it must smooth gain
+# across consecutive blocks (an exponential moving average on the gain factor,
+# not a fresh RMS-based decision every block) before it touches the audio
+# actually sent to Gemini.
 
 
 def _load_system_prompt() -> str:
@@ -1047,39 +1047,49 @@ class JudoLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            # ── Wake-word gate ───────────────────────────────────────────────
-            # While asleep, the mic audio NEVER goes to Gemini (nothing is
-            # streamed, so JUDO can't respond to speech not addressed to it and
-            # nothing leaves the machine). Frames are instead handed to the local
-            # detector, which runs its model in ITS OWN thread — the cost here is
-            # only a queue push, so the audio path is never slowed. When wake word
-            # is off (default) or we're awake, this is a single boolean check.
-            if self._wake_enabled and not self._awake:
-                det = self._wake_detector
-                if det is not None:
-                    det.feed(indata)
-                return
-            with self._speaking_lock:
-                judo_speaking = self._is_speaking
-            if not judo_speaking and not self.ui.muted and not self._phone_active:
-                # Only real, currently-heard user speech should shape the
-                # gender guess — never JUDO's own voice or silence.
-                try:
-                    self._gender_estimator.feed(indata, SEND_SAMPLE_RATE)
-                except Exception:
-                    pass
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
-                # Feed the live mic level to the HUD so the waveform reacts to
-                # the user's actual voice while listening. Purely cosmetic — any
-                # failure here must never disturb the mic.
-                try:
-                    self.ui.set_audio_level(_pcm_level(indata))
-                except Exception:
-                    pass
+            # Outer safety net: sounddevice stops the WHOLE input stream if this
+            # callback ever raises — so any unexpected failure here (e.g.
+            # call_soon_threadsafe on a loop mid-teardown during a reconnect)
+            # must drop just this one frame, never take the mic down with it.
+            # The two inner try/excepts below are for known-cosmetic paths and
+            # stay as extra documentation of intent; this one is the backstop.
+            try:
+                # ── Wake-word gate ───────────────────────────────────────────
+                # While asleep, the mic audio NEVER goes to Gemini (nothing is
+                # streamed, so JUDO can't respond to speech not addressed to it
+                # and nothing leaves the machine). Frames are instead handed to
+                # the local detector, which runs its model in ITS OWN thread —
+                # the cost here is only a queue push, so the audio path is
+                # never slowed. When wake word is off (default) or we're
+                # awake, this is a single boolean check.
+                if self._wake_enabled and not self._awake:
+                    det = self._wake_detector
+                    if det is not None:
+                        det.feed(indata)
+                    return
+                with self._speaking_lock:
+                    judo_speaking = self._is_speaking
+                if not judo_speaking and not self.ui.muted and not self._phone_active:
+                    # Only real, currently-heard user speech should shape the
+                    # gender guess — never JUDO's own voice or silence.
+                    try:
+                        self._gender_estimator.feed(indata, SEND_SAMPLE_RATE)
+                    except Exception:
+                        pass
+                    data = indata.tobytes()
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait,
+                        {"data": data, "mime_type": "audio/pcm"}
+                    )
+                    # Feed the live mic level to the HUD so the waveform reacts
+                    # to the user's actual voice while listening. Purely
+                    # cosmetic — any failure here must never disturb the mic.
+                    try:
+                        self.ui.set_audio_level(_pcm_level(indata))
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[JUDO] ⚠️ Mic callback error (frame dropped, stream continues): {e}")
 
         try:
             def _open_mic(dev):
@@ -1500,13 +1510,8 @@ class JudoLive:
             "Output ONLY the summary text, nothing else:\n\n" + convo
         )
         try:
-            from google import genai as _genai
-            client = _genai.Client(api_key=_get_api_key())
-            resp   = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-flash-latest",
-                contents=prompt,
-            )
+            from core.text_model import get_text_model
+            resp    = await asyncio.to_thread(get_text_model().generate_content, prompt)
             summary = (resp.text or "").strip()
             if summary:
                 save_session_summary(summary, lang)
