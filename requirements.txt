@@ -1,8 +1,7 @@
 # ── Core: UI, audio, Gemini Live ──────────────────────────────────────────────
 PyQt6
 sounddevice
-# sounddevice 0.5.6 still assigns to ndarray.shape; NumPy 2.5 warns there.
-numpy<2.5
+numpy
 google-genai>=2.8.0
 
 # ── Web search & browser control ──────────────────────────────────────────────

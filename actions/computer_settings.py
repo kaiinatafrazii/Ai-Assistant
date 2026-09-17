@@ -489,17 +489,16 @@ def open_system_settings():
                 return
 
 def open_file_explorer():
-    desktop = user_paths.desktop()
     if _OS == "Windows":
         pyautogui.hotkey("win", "e")
     elif _OS == "Darwin":
-        subprocess.Popen(["open", str(desktop)])
+        subprocess.Popen(["open", str(Path.home())])
     else:
-        for cmd in [["nautilus", str(desktop)], ["thunar", str(desktop)], ["dolphin", str(desktop)], ["nemo", str(desktop)]]:
+        for cmd in [["nautilus"], ["thunar"], ["dolphin"], ["nemo"]]:
             if subprocess.run(["which", cmd[0]], capture_output=True).returncode == 0:
                 subprocess.Popen(cmd)
                 return
-        subprocess.Popen(["xdg-open", str(desktop)])
+        subprocess.Popen(["xdg-open", str(Path.home())])
 
 def sleep_display():
     if _OS == "Windows":

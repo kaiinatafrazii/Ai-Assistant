@@ -56,6 +56,8 @@ from memory.memory_manager import (
     save_session_summary, pop_last_session,
     search_memory, set_trim_notifier,
 )
+from memory import self_training
+from core.self_trainer import SelfTrainer
 
 # The file-backed tools (open_app, web_search, browser_control, …) are no longer
 # imported or declared here — they self-describe via a TOOL dict in their own
@@ -418,6 +420,8 @@ class JudoLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._last_action_tool = ""                # name+args of the last non-undo tool call, for self-training
+        self._self_trainer     = SelfTrainer()     # practises routing/coding while the user is idle
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
 
@@ -816,6 +820,9 @@ class JudoLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        lessons_str = self_training.format_lessons_for_prompt()
+        if lessons_str:
+            parts.append(lessons_str)
         parts.append(sys_prompt)
 
         cfg = dict(
@@ -864,6 +871,10 @@ class JudoLive:
         print(f"[JUDO] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
+        if name != "undo":
+            _preview = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
+            self._last_action_tool = f"{name}({_preview})" if _preview else name
+
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -896,7 +907,15 @@ class JudoLive:
                               + "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
                               ) if items else "I have not changed anything I can undo yet."
                 else:
+                    prior_action = self._last_action_tool
                     result = await loop.run_in_executor(None, undo_stack.undo_last)
+                    if prior_action and not result.startswith("There is nothing to undo"):
+                        prior_command = next(
+                            (t[len("User: "):] for t in reversed(self._session_log) if t.startswith("User: ")),
+                            ""
+                        )
+                        if prior_command:
+                            self_training.log_understanding_mistake(prior_command, prior_action)
 
             elif name == "screen_process":
                 import time as _t_mod
@@ -1590,6 +1609,33 @@ class JudoLive:
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
+    # ── Self-training ────────────────────────────────────────────────────────────
+
+    async def _run_self_training(self) -> None:
+        """Background task: while the user is idle, JUDO quizzes itself on its own
+        tool routing and code generation and writes down what it got wrong.
+
+        Deliberately independent of the Live session — drills are text-only calls
+        (see core/self_trainer.py), so this never speaks, never interrupts, and
+        never executes a tool. It runs even while sleeping: practice needs no
+        conversation, and the hours JUDO spends waiting for a wake word are
+        exactly the hours worth practising in."""
+        while True:
+            await asyncio.sleep(60)
+
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or not self._self_trainer.should_trigger(self._last_user_speech):
+                continue
+
+            self._self_trainer.mark_triggered()
+            tools = (TOOL_DECLARATIONS
+                     + self._action_registry.get_tool_declarations()
+                     + self._plugin_registry.get_tool_declarations())
+            line = await asyncio.to_thread(self._self_trainer.run_drill, tools)
+            if line:
+                self.ui.write_log(f"SYS: self-training {line}")
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -1750,6 +1796,7 @@ class JudoLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._run_self_training())
                     tg.create_task(self._run_sleep_watch())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
